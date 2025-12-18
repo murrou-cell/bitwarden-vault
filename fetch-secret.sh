@@ -35,6 +35,11 @@ echo "$ITEMS_JSON" | jq -c --arg prefix "$PREFIX" '
     echo "SECRET NAMESPACE: $secret_namespace"
 
     echo "SECRET DATA:*HIDDEN FOR SECURITY*"
+    # Ensure namespace exists
+    if ! kubectl get namespace "$secret_namespace" >/dev/null 2>&1; then
+        echo "Namespace $secret_namespace does not exist, creating..."
+        kubectl create namespace "$secret_namespace"
+    fi
 
     # Create or update secret with all fields
     kubectl create secret generic "$k8s_secret_name" \
