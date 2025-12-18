@@ -36,21 +36,12 @@ echo "$ITEMS_JSON" | jq -c --arg prefix "$PREFIX" '
 
     echo "SECRET DATA:*HIDDEN FOR SECURITY*"
 
-    # Create/update secret
+    # Create or update secret with all fields
     kubectl create secret generic "$k8s_secret_name" \
-      --from-literal="" \
-      -n "$secret_namespace" --dry-run=client -o yaml \
-      | kubectl apply -f - >/dev/null
+    $(echo "$secret_data" | sed 's/^/--from-literal=/') \
+    -n "$secret_namespace" --dry-run=client -o yaml \
+    | kubectl apply -f - >/dev/null
 
-    # Apply each key=value pair
-    while IFS= read -r FIELD; do
-        KEY=$(echo "$FIELD" | cut -d '=' -f1)
-        VALUE=$(echo "$FIELD" | cut -d '=' -f2-)
-        kubectl create secret generic "$k8s_secret_name" \
-          --from-literal="$KEY=$VALUE" \
-          -n "$secret_namespace" --dry-run=client -o yaml \
-          | kubectl apply -f - >/dev/null
-    done <<< "$SECRET_DATA"
     
     echo "==============================="
 done
