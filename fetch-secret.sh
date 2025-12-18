@@ -3,7 +3,7 @@ set -euo pipefail
 
 PREFIX="bitwarden-vault/"
 
-# Check if already logged in
+# Login
 if ! bw login --check >/dev/null 2>&1; then
     echo "Logging in to Bitwarden..."
     bw login --apikey
@@ -18,34 +18,67 @@ echo "Fetching all vault items..."
 ITEMS_JSON=$(bw list items --session "$SESSION")
 
 echo "$ITEMS_JSON" | jq -c --arg prefix "$PREFIX" '
-  .[] 
-  | select(.name | startswith($prefix)) 
+  .[]
+  | select(.name | startswith($prefix))
   | select(.fields? != null and (.fields | length > 0))
 ' | while IFS= read -r ITEM; do
     SECRET_NAME=$(echo "$ITEM" | jq -r '.name')
-    echo "==============================="
-    echo "SECRET NAME: $SECRET_NAME"
+    SECRET_TYPE=$(echo "$ITEM" | jq -r '.fields[]? | select(.name=="type") | .value // "generic"')
 
     k8s_secret_name=$(echo "$SECRET_NAME" | awk -F'/' '{print $NF}')
     secret_namespace=$(echo "$SECRET_NAME" | awk -F'/' '{print $2}')
-    secret_data=$(echo "$ITEM" | jq -r '.fields[] | "\(.name)=\(.value)"')
 
+    echo "==============================="
+    echo "SECRET NAME: $SECRET_NAME"
     echo "K8S SECRET NAME: $k8s_secret_name"
+    echo "NAMESPACE: $secret_namespace"
+    echo "TYPE: $SECRET_TYPE"
 
-    echo "SECRET NAMESPACE: $secret_namespace"
-
-    echo "SECRET DATA:*HIDDEN FOR SECURITY*"
     # Ensure namespace exists
     if ! kubectl get namespace "$secret_namespace" >/dev/null 2>&1; then
-        echo "Namespace $secret_namespace does not exist, creating..."
+        echo "Creating namespace $secret_namespace"
         kubectl create namespace "$secret_namespace"
     fi
 
-    # Create or update secret with all fields
+    # ---- dockerconfigjson secret ----
+    if [[ "$SECRET_TYPE" == "dockerconfigjson" ]]; then
+        DOCKER_JSON=$(echo "$ITEM" | jq -r '
+          .fields[] | select(.name=="dockerconfigjson") | .value
+        ')
+
+        if [[ -z "$DOCKER_JSON" ]]; then
+            echo "ERROR: dockerconfigjson field missing for $SECRET_NAME"
+            continue
+        fi
+
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $k8s_secret_name
+  namespace: $secret_namespace
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $(echo -n "$DOCKER_JSON" | base64 | tr -d '\n')
+EOF
+
+        echo "dockerconfigjson secret applied"
+        continue
+    fi
+
+    # ---- generic secret ----
+    secret_data=$(echo "$ITEM" | jq -r '
+      .fields[]
+      | select(.name != "type")
+      | "\(.name)=\(.value)"
+    ')
+
     kubectl create secret generic "$k8s_secret_name" \
-    $(echo "$secret_data" | sed 's/^/--from-literal=/') \
-    -n "$secret_namespace" --dry-run=client -o yaml \
+      $(echo "$secret_data" | sed 's/^/--from-literal=/') \
+      -n "$secret_namespace" \
+      --dry-run=client -o yaml \
     | kubectl apply -f - >/dev/null
 
+    echo "generic secret applied"
     echo "==============================="
 done
