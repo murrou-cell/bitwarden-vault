@@ -47,6 +47,5 @@ echo "$ITEMS_JSON" | jq -c --arg prefix "$PREFIX" '
     -n "$secret_namespace" --dry-run=client -o yaml \
     | kubectl apply -f - >/dev/null
 
-    
     echo "==============================="
 done
