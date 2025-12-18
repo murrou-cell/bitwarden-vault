@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bitwarden-vault
+  labels:
+    app.kubernetes.io/name: bitwarden-vault
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  schedule: "{{ .Values.schedule }}"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: {{ .Values.serviceAccountName }}
+          restartPolicy: OnFailure
+          containers:
+            - name: bitwarden-sync
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              envFrom:
+                - secretRef:
+                  name: bw-credentials
+              command: ["/bin/bash", "-c"]
+              args:
+                - "/app/fetch-secrets.sh"
+              {{- if .Values.persistence.enabled }}
+              volumeMounts:
+                - name: bw-data
+                  mountPath: "{{ .Values.persistence.mountPath }}"
+              {{- end }}

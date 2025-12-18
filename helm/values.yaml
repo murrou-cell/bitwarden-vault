@@ -1,0 +1,18 @@
+prefix: "bitwarden-vault/"
+
+schedule: "0 * * * *"
+
+serviceAccountName: "bitwarden-vault"
+image:
+  repository: ghcr.io/murrou-cell/bitwarden-vault
+  tag: main
+  pullPolicy: Always
+
+env: {}
+
+# Persistent storage for Bitwarden CLI data.json
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: "" # optional, leave empty for default
+  mountPath: /root/.config/Bitwarden\ CLI/
