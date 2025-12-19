@@ -66,19 +66,25 @@ EOF
         continue
     fi
 
-    # ---- generic secret ----
-    secret_data=$(echo "$ITEM" | jq -r '
-      .fields[]
-      | select(.name != "type")
-      | "\(.name)=\(.value)"
-    ')
+  # ---- generic secret ----
+  secret_data=$(echo "$ITEM" | jq -r '
+    .fields[]
+    | select(.name != "type")
+    | "\(.name)=\(.value|@sh)"
+  ')
 
-    kubectl create secret generic "$k8s_secret_name" \
-      $(echo "$secret_data" | sed 's/^/--from-literal=/') \
-      -n "$secret_namespace" \
-      --dry-run=client -o yaml \
-    | kubectl apply -f - >/dev/null
+  # Build kubectl arguments safely
+  kubectl_args=()
+  while IFS= read -r line; do
+      # Remove surrounding single quotes added by @sh
+      line="${line#\'}"
+      line="${line%\'}"
+      kubectl_args+=(--from-literal="$line")
+  done <<< "$secret_data"
 
-    echo "generic secret applied"
-    echo "==============================="
+  kubectl create secret generic "$k8s_secret_name" \
+    "${kubectl_args[@]}" \
+    -n "$secret_namespace" \
+    --dry-run=client -o yaml \
+  | kubectl apply -f - >/dev/null
 done
