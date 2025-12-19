@@ -70,16 +70,16 @@ EOF
   secret_data=$(echo "$ITEM" | jq -r '
     .fields[]
     | select(.name != "type")
-    | "\(.name)=\(.value|@sh)"
+    | "\(.name)=\(.value)"
   ')
 
-  # Build kubectl arguments safely
+  # Build kubectl arguments safely, preserving spaces
   kubectl_args=()
   while IFS= read -r line; do
-      # Remove surrounding single quotes added by @sh
-      line="${line#\'}"
-      line="${line%\'}"
-      kubectl_args+=(--from-literal="$line")
+      # Wrap value in quotes only if it contains spaces
+      key="${line%%=*}"
+      value="${line#*=}"
+      kubectl_args+=(--from-literal="$key=$value")
   done <<< "$secret_data"
 
   kubectl create secret generic "$k8s_secret_name" \
