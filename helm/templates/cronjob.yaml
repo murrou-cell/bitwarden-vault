@@ -23,7 +23,7 @@ spec:
                     name: bw-credentials
               volumeMounts:
                 - name: bw-data
-                  mountPath: /root/.config/Bitwarden\ CLI/
+                  mountPath: "/root/.config/Bitwarden CLI/"
           volumes:
             - name: bw-data
               persistentVolumeClaim:
