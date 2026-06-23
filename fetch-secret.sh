@@ -16,6 +16,9 @@ fi
 echo "Unlocking Vault..."
 SESSION=$(bw unlock "$BW_PASSWORD" --raw)
 
+echo "Syncing vault..."
+bw sync --session "$SESSION"
+
 echo "Fetching all vault items..."
 ITEMS_JSON=$(bw list items --session "$SESSION")
 
