@@ -3,8 +3,16 @@ set -euo pipefail
 
 PREFIX="bitwarden-vault/"
 
+# Reserved control-field names. Everything else on an item becomes a key in
+# the resulting Kubernetes Secret, so a Secret cannot carry a data key with
+# one of these exact names.
+#   type   - "generic" (default, Opaque) or "dockerconfigjson"
+#   mode   - "create" (default, replace) or "merge" (patch in place)
+#   labels - optional JSON object, applied to metadata.labels
+CONTROL='["type","mode","labels"]'
+
 # -----------------------------
-# Login
+# Login + unlock
 # -----------------------------
 if ! bw login --check >/dev/null 2>&1; then
     echo "Logging in to Bitwarden..."
@@ -22,138 +30,112 @@ bw sync --session "$SESSION"
 echo "Fetching all vault items..."
 ITEMS_JSON=$(bw list items --session "$SESSION")
 
-# -----------------------------
-# Helper: build JSON for patch
-# -----------------------------
-build_patch_json() {
-  local json="{}"
+# =============================================================================
+# apply_one <item-json>
+# Handles a single vault item. Returns non-zero on failure so the caller can
+# skip it without aborting the whole run. Runs in a subshell (see the loop),
+# so `set -e` failures here don't kill the parent.
+# =============================================================================
+apply_one() {
+    local ITEM="$1"
 
-  while IFS= read -r line; do
-    key="${line%%=*}"
-    value="${line#*=}"
-    json=$(echo "$json" | jq --arg k "$key" --arg v "$value" '. + {($k): $v}')
-  done <<< "$1"
-
-  echo "$json"
-}
-
-# -----------------------------
-# Process items
-# -----------------------------
-echo "$ITEMS_JSON" | jq -c --arg prefix "$PREFIX" '
-  .[]
-  | select(.name | startswith($prefix))
-  | select(.fields? != null and (.fields | length > 0))
-' | while IFS= read -r ITEM; do
-
-    SECRET_NAME=$(echo "$ITEM" | jq -r '.name')
-    SECRET_TYPE=$(echo "$ITEM" | jq -r '.fields[]? | select(.name=="type") | .value // "generic"')
-    SECRET_MODE=$(echo "$ITEM" | jq -r '.fields[]? | select(.name=="mode") | .value // "create"')
-
-    k8s_secret_name=$(echo "$SECRET_NAME" | awk -F'/' '{print $NF}')
-    secret_namespace=$(echo "$SECRET_NAME" | awk -F'/' '{print $2}')
+    local SECRET_NAME k8s_secret_name secret_namespace SECRET_TYPE SECRET_MODE
+    SECRET_NAME=$(jq -r '.name' <<<"$ITEM")
+    k8s_secret_name=$(awk -F'/' '{print $NF}' <<<"$SECRET_NAME")
+    secret_namespace=$(awk -F'/' '{print $2}' <<<"$SECRET_NAME")
+    SECRET_TYPE=$(jq -r 'first(.fields[]? | select(.name=="type")  | .value) // "generic"' <<<"$ITEM")
+    SECRET_MODE=$(jq -r 'first(.fields[]? | select(.name=="mode")  | .value) // "create"'  <<<"$ITEM")
 
     echo "==============================="
-    echo "SECRET NAME: $SECRET_NAME"
+    echo "SECRET NAME:     $SECRET_NAME"
     echo "K8S SECRET NAME: $k8s_secret_name"
-    echo "NAMESPACE: $secret_namespace"
-    echo "TYPE: $SECRET_TYPE"
-    echo "MODE: $SECRET_MODE"
+    echo "NAMESPACE:       $secret_namespace"
+    echo "TYPE:            $SECRET_TYPE"
+    echo "MODE:            $SECRET_MODE"
 
-    # Ensure namespace exists
+    # never let the tool clobber Argo CD's own secret
+    if [[ "$k8s_secret_name" == "argocd-secret" ]]; then
+        echo "Detected argocd-secret -> forcing MERGE mode"
+        SECRET_MODE="merge"
+    fi
+
     if ! kubectl get namespace "$secret_namespace" >/dev/null 2>&1; then
         echo "Creating namespace $secret_namespace"
         kubectl create namespace "$secret_namespace"
     fi
 
-    # -----------------------------
-    # Docker config secret
-    # -----------------------------
+    # optional metadata.labels (control field "labels" holding a JSON object)
+    local LABELS_JSON
+    LABELS_JSON=$(jq -c 'first(.fields[]? | select(.name=="labels") | .value) // "{}" | fromjson' <<<"$ITEM")
+
+    # k8s Secret type + the data object, values base64-encoded (handles
+    # multi-line, "=", quotes, anything - no line-based parsing).
+    local K8S_TYPE DATA_JSON
     if [[ "$SECRET_TYPE" == "dockerconfigjson" ]]; then
-        DOCKER_JSON=$(echo "$ITEM" | jq -r '
-          .fields[] | select(.name=="dockerconfigjson") | .value
-        ')
+        K8S_TYPE="kubernetes.io/dockerconfigjson"
+        DATA_JSON=$(jq -c --argjson c "$CONTROL" '
+            [.fields[] | select(.name | IN($c[]) | not)
+             | {(if .name == "dockerconfigjson" then ".dockerconfigjson" else .name end):
+                (.value | @base64)}]
+            | add // {}' <<<"$ITEM")
+    else
+        K8S_TYPE="Opaque"
+        DATA_JSON=$(jq -c --argjson c "$CONTROL" '
+            [.fields[] | select(.name | IN($c[]) | not)
+             | {(.name): (.value | @base64)}]
+            | add // {}' <<<"$ITEM")
+    fi
 
-        if [[ -z "$DOCKER_JSON" ]]; then
-            echo "ERROR: dockerconfigjson field missing for $SECRET_NAME"
-            continue
-        fi
-
-        kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: $k8s_secret_name
-  namespace: $secret_namespace
-type: kubernetes.io/dockerconfigjson
-data:
-  .dockerconfigjson: $(echo -n "$DOCKER_JSON" | base64 | tr -d '\n')
-EOF
-
-        echo "dockerconfigjson secret applied"
-        continue
+    if [[ "$DATA_JSON" == "{}" || "$DATA_JSON" == "null" ]]; then
+        echo "ERROR: no data fields on $SECRET_NAME"; return 1
     fi
 
     # -----------------------------
-    # Generic secret processing
-    # -----------------------------
-    secret_data=$(echo "$ITEM" | jq -r '
-      .fields[]
-      | select(.name != "type" and .name != "mode")
-      | "\(.name)=\(.value)"
-    ')
-
-    # FORCE safety: never overwrite argocd-secret
-    if [[ "$k8s_secret_name" == "argocd-secret" ]]; then
-        echo "Detected argocd-secret → forcing MERGE mode"
-        SECRET_MODE="merge"
-    fi
-
-    # -----------------------------
-    # MERGE mode (safe patch)
+    # MERGE: patch data (+labels) into the existing secret, leaving every
+    # other key / label / annotation / .type untouched.
     # -----------------------------
     if [[ "$SECRET_MODE" == "merge" ]]; then
-        echo "Merging into secret: $k8s_secret_name"
-
-        patch_json=$(build_patch_json "$secret_data")
-
-        # Try patch first
         if kubectl get secret "$k8s_secret_name" -n "$secret_namespace" >/dev/null 2>&1; then
-            kubectl patch secret "$k8s_secret_name" \
-              -n "$secret_namespace" \
-              --type merge \
-              -p "{\"stringData\": $patch_json}"
-        else
-            echo "Secret does not exist, creating..."
-            kubectl create secret generic "$k8s_secret_name" \
-              -n "$secret_namespace" \
-              --from-literal="$(echo "$secret_data" | tr '\n' ' ')" \
-              --dry-run=client -o yaml \
-            | kubectl apply -f - >/dev/null
+            local patch
+            patch=$(jq -nc --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
+                '{data:$data} + (if ($labels|length) > 0 then {metadata:{labels:$labels}} else {} end)')
+            kubectl patch secret "$k8s_secret_name" -n "$secret_namespace" --type merge -p "$patch"
+            echo "merge applied"
+            return 0
         fi
-
-        echo "merge applied"
-        continue
+        echo "Secret does not exist yet - creating it instead of merging"
     fi
 
     # -----------------------------
-    # CREATE mode (default overwrite)
+    # CREATE (default): apply a full manifest built from the item.
     # -----------------------------
-    echo "Creating/replacing secret: $k8s_secret_name"
-
-    kubectl_args=()
-    while IFS= read -r line; do
-        key="${line%%=*}"
-        value="${line#*=}"
-        kubectl_args+=(--from-literal="$key=$value")
-    done <<< "$secret_data"
-
-    kubectl create secret generic "$k8s_secret_name" \
-      "${kubectl_args[@]}" \
-      -n "$secret_namespace" \
-      --dry-run=client -o yaml \
-    | kubectl apply -f - >/dev/null
-
+    jq -nc \
+        --arg name "$k8s_secret_name" --arg ns "$secret_namespace" --arg stype "$K8S_TYPE" \
+        --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
+        '{apiVersion:"v1", kind:"Secret", type:$stype, data:$data,
+          metadata: ({name:$name, namespace:$ns}
+                     + (if ($labels|length) > 0 then {labels:$labels} else {} end))}' \
+      | kubectl apply -f - >/dev/null
     echo "secret applied"
+}
 
-done
+# -----------------------------
+# Process all bitwarden-vault/* items. One bad item is logged and skipped;
+# the run still processes everything else and exits 0 unless nothing worked.
+# -----------------------------
+failed=0
+total=0
+while IFS= read -r ITEM; do
+    total=$((total + 1))
+    if ! ( apply_one "$ITEM" ); then
+        name=$(jq -r '.name' <<<"$ITEM" 2>/dev/null || echo "?")
+        echo "!!! FAILED: $name - skipping, continuing with the rest"
+        failed=$((failed + 1))
+    fi
+done < <(jq -c --arg prefix "$PREFIX" '
+    .[] | select(.name | startswith($prefix))
+        | select(.fields? != null and (.fields | length > 0))' <<<"$ITEMS_JSON")
+
+echo "==============================="
+echo "Done: $((total - failed))/$total secrets applied, $failed failed."
+[[ "$failed" -lt "$total" ]]
