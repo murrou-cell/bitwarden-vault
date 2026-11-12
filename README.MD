@@ -18,7 +18,7 @@ Secret. Field **values are base64-encoded as-is**, so multi-line values
 (private keys, cookie jars, PEM bundles) and values containing `=`, spaces
 or quotes are all handled.
 
-Three field names are reserved as controls (a Secret therefore cannot have a
+Four field names are reserved as controls (a Secret therefore cannot have a
 data key with one of these exact names):
 
 | field    | values | meaning |
@@ -26,6 +26,7 @@ data key with one of these exact names):
 | `type`   | `generic` (default) / `dockerconfigjson` | `dockerconfigjson` produces a `kubernetes.io/dockerconfigjson` Secret; put the raw `{"auths":...}` JSON in a field named `dockerconfigjson`. |
 | `mode`   | `create` (default) / `merge` | `create` applies a full manifest (replaces the Secret, drops keys/labels not re-specified). `merge` patches only the listed keys (and `labels`) into an existing Secret, leaving everything else — other keys, `.type`, annotations, labels — untouched. Use `merge` for any Secret that must keep a label it doesn't declare here (e.g. an Argo CD `repository` Secret). `argocd-secret` is always forced to `merge`. |
 | `labels` | JSON object | applied to `metadata.labels`. |
+| `replicate` | `all` / comma-separated namespaces | also write the Secret into those namespaces (`all` = every Active namespace except `kube-*`). An explicit `bitwarden-vault/<ns>/<same-name>` item wins over a replica. Replicas are not pruned if the field is removed. Needs `list` on namespaces. |
 
 One bad item is logged (`!!! FAILED: …`) and skipped; the run still processes
 everything else. The job only fails if *nothing* synced.
