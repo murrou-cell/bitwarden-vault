@@ -9,7 +9,8 @@ PREFIX="bitwarden-vault/"
 #   type   - "generic" (default, Opaque) or "dockerconfigjson"
 #   mode   - "create" (default, replace) or "merge" (patch in place)
 #   labels - optional JSON object, applied to metadata.labels
-CONTROL='["type","mode","labels"]'
+#   replicate - "all" or comma-separated namespaces: also write the Secret there
+CONTROL='["type","mode","labels","replicate"]'
 
 # -----------------------------
 # Login + unlock
@@ -29,6 +30,55 @@ bw sync --session "$SESSION"
 
 echo "Fetching all vault items..."
 ITEMS_JSON=$(bw list items --session "$SESSION")
+EXPLICIT_NAMES=$(jq -r --arg prefix "$PREFIX" '.[] | .name | select(startswith($prefix))' <<<"$ITEMS_JSON")
+
+# write_secret <name> <ns> <k8s-type> <mode> <data-json> <labels-json>
+write_secret() {
+    local k8s_secret_name="$1" ns="$2" K8S_TYPE="$3" SECRET_MODE="$4" DATA_JSON="$5" LABELS_JSON="$6"
+
+    # -----------------------------
+    # MERGE: patch data (+labels) into the existing secret, leaving every
+    # other key / label / annotation / .type untouched.
+    # -----------------------------
+    if [[ "$SECRET_MODE" == "merge" ]]; then
+        if kubectl get secret "$k8s_secret_name" -n "$ns" >/dev/null 2>&1; then
+            local patch
+            patch=$(jq -nc --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
+                '{data:$data} + (if ($labels|length) > 0 then {metadata:{labels:$labels}} else {} end)')
+            kubectl patch secret "$k8s_secret_name" -n "$ns" --type merge -p "$patch"
+            echo "merge applied in $ns"
+            return 0
+        fi
+        echo "Secret does not exist yet - creating it instead of merging"
+    fi
+
+    # -----------------------------
+    # CREATE (default): apply a full manifest built from the item.
+    # -----------------------------
+    jq -nc \
+        --arg name "$k8s_secret_name" --arg ns "$ns" --arg stype "$K8S_TYPE" \
+        --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
+        '{apiVersion:"v1", kind:"Secret", type:$stype, data:$data,
+          metadata: ({name:$name, namespace:$ns}
+                     + (if ($labels|length) > 0 then {labels:$labels} else {} end))}' \
+      | kubectl apply -f - >/dev/null || return 1
+    echo "secret applied in $ns"
+}
+
+# replica_namespaces <replicate-value>: prints target namespaces, one per line
+replica_namespaces() {
+    local value="$1"
+    if [[ "$value" == "all" ]]; then
+        kubectl get namespaces -o json | jq -r '
+            .items[] | select(.status.phase == "Active")
+            | .metadata.name | select(startswith("kube-") | not)'
+    else
+        tr ',' '\n' <<<"$value" | sed 's/^ *//;s/ *$//' | while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            if kubectl get namespace "$n" >/dev/null 2>&1; then echo "$n"; else echo "replica namespace $n missing, skipping" >&2; fi
+        done
+    fi
+}
 
 # =============================================================================
 # apply_one <item-json>
@@ -90,33 +140,25 @@ apply_one() {
         echo "ERROR: no data fields on $SECRET_NAME"; return 1
     fi
 
-    # -----------------------------
-    # MERGE: patch data (+labels) into the existing secret, leaving every
-    # other key / label / annotation / .type untouched.
-    # -----------------------------
-    if [[ "$SECRET_MODE" == "merge" ]]; then
-        if kubectl get secret "$k8s_secret_name" -n "$secret_namespace" >/dev/null 2>&1; then
-            local patch
-            patch=$(jq -nc --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
-                '{data:$data} + (if ($labels|length) > 0 then {metadata:{labels:$labels}} else {} end)')
-            kubectl patch secret "$k8s_secret_name" -n "$secret_namespace" --type merge -p "$patch"
-            echo "merge applied"
-            return 0
-        fi
-        echo "Secret does not exist yet - creating it instead of merging"
-    fi
+    # source namespace first, then replicas (explicit per-namespace items win)
+    write_secret "$k8s_secret_name" "$secret_namespace" "$K8S_TYPE" "$SECRET_MODE" "$DATA_JSON" "$LABELS_JSON" || return 1
 
-    # -----------------------------
-    # CREATE (default): apply a full manifest built from the item.
-    # -----------------------------
-    jq -nc \
-        --arg name "$k8s_secret_name" --arg ns "$secret_namespace" --arg stype "$K8S_TYPE" \
-        --argjson data "$DATA_JSON" --argjson labels "$LABELS_JSON" \
-        '{apiVersion:"v1", kind:"Secret", type:$stype, data:$data,
-          metadata: ({name:$name, namespace:$ns}
-                     + (if ($labels|length) > 0 then {labels:$labels} else {} end))}' \
-      | kubectl apply -f - >/dev/null
-    echo "secret applied"
+    local REPLICATE
+    REPLICATE=$(jq -r 'first(.fields[]? | select(.name=="replicate") | .value) // ""' <<<"$ITEM")
+    [[ -z "$REPLICATE" ]] && return 0
+
+    local rc=0 ns targets
+    targets=$(replica_namespaces "$REPLICATE") || return 1
+    while IFS= read -r ns; do
+        [[ -z "$ns" || "$ns" == "$secret_namespace" ]] && continue
+        if grep -Fxq "$PREFIX$ns/$k8s_secret_name" <<<"$EXPLICIT_NAMES"; then
+            echo "replica $ns: explicit item exists, skipping"; continue
+        fi
+        if ! write_secret "$k8s_secret_name" "$ns" "$K8S_TYPE" "$SECRET_MODE" "$DATA_JSON" "$LABELS_JSON"; then
+            echo "replica $ns: FAILED"; rc=1
+        fi
+    done <<<"$targets"
+    return "$rc"
 }
 
 # -----------------------------
